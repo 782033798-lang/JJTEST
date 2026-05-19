@@ -16,12 +16,12 @@ const PORT = process.env.PORT || 3000;
 // --- Database setup ---
 const dbPath = path.join(__dirname, 'chat.db');
 const db = new Database(dbPath);
-
 db.pragma('journal_mode = WAL');
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS messages (
     id TEXT PRIMARY KEY,
+    channel TEXT NOT NULL DEFAULT 'public',
     username TEXT NOT NULL,
     avatar TEXT,
     type TEXT NOT NULL DEFAULT 'text',
@@ -30,24 +30,31 @@ db.exec(`
     fileSize INTEGER,
     fileUrl TEXT,
     thumbUrl TEXT,
+    encrypted INTEGER NOT NULL DEFAULT 0,
     createdAt TEXT NOT NULL DEFAULT (datetime('now'))
   )
 `);
 
+// Add channel column if upgrading from old schema
+try { db.exec(`ALTER TABLE messages ADD COLUMN channel TEXT NOT NULL DEFAULT 'public'`); } catch {}
+try { db.exec(`ALTER TABLE messages ADD COLUMN encrypted INTEGER NOT NULL DEFAULT 0`); } catch {}
+
 const insertMsg = db.prepare(`
-  INSERT INTO messages (id, username, avatar, type, content, fileName, fileSize, fileUrl, thumbUrl, createdAt)
-  VALUES (@id, @username, @avatar, @type, @content, @fileName, @fileSize, @fileUrl, @thumbUrl, @createdAt)
+  INSERT INTO messages (id, channel, username, avatar, type, content, fileName, fileSize, fileUrl, thumbUrl, encrypted, createdAt)
+  VALUES (@id, @channel, @username, @avatar, @type, @content, @fileName, @fileSize, @fileUrl, @thumbUrl, @encrypted, @createdAt)
 `);
 
-const getMessages = db.prepare(`
-  SELECT * FROM messages ORDER BY createdAt ASC
+const getChannelMessages = db.prepare(`
+  SELECT * FROM messages WHERE channel = @channel ORDER BY createdAt DESC LIMIT @limit OFFSET @offset
 `);
 
-const getMessagesPaginated = db.prepare(`
-  SELECT * FROM messages ORDER BY createdAt DESC LIMIT @limit OFFSET @offset
+const countChannelMessages = db.prepare(`
+  SELECT COUNT(*) AS total FROM messages WHERE channel = @channel
 `);
 
-const countMessages = db.prepare(`SELECT COUNT(*) AS total FROM messages`);
+function dmChannel(a, b) {
+  return 'dm:' + [a, b].sort().join(':');
+}
 
 // --- Socket.IO ---
 const io = new Server(server, {
@@ -59,12 +66,11 @@ const io = new Server(server, {
 app.use(cors());
 app.use(express.json());
 
-// Serve uploaded files
 const uploadsDir = path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
 app.use('/uploads', express.static(uploadsDir));
 
-// --- File upload with multer ---
+// --- File upload ---
 const storage = multer.diskStorage({
   destination: (_req, _file, cb) => cb(null, uploadsDir),
   filename: (_req, file, cb) => {
@@ -73,33 +79,27 @@ const storage = multer.diskStorage({
   },
 });
 
-const upload = multer({
-  storage,
-  limits: { fileSize: 50 * 1024 * 1024 }, // 50 MB
-});
+const upload = multer({ storage, limits: { fileSize: 50 * 1024 * 1024 } });
 
-// --- REST API ---
-
-// Upload file
 app.post('/api/upload', upload.single('file'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
-  const fileUrl = `/uploads/${req.file.filename}`;
   res.json({
     fileName: req.file.originalname,
     fileSize: req.file.size,
-    fileUrl,
+    fileUrl: `/uploads/${req.file.filename}`,
     mimeType: req.file.mimetype,
   });
 });
 
-// Get chat history (paginated)
+// Get messages for a channel (public or dm)
 app.get('/api/messages', (req, res) => {
+  const channel = req.query.channel || 'public';
   const page = Math.max(1, parseInt(req.query.page) || 1);
   const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 50));
   const offset = (page - 1) * limit;
 
-  const rows = getMessagesPaginated.all({ limit, offset });
-  const { total } = countMessages.get();
+  const rows = getChannelMessages.all({ channel, limit, offset });
+  const { total } = countChannelMessages.get({ channel });
 
   res.json({
     messages: rows.reverse(),
@@ -114,30 +114,39 @@ app.get('/api/messages', (req, res) => {
 const onlineUsers = new Map();
 
 io.on('connection', (socket) => {
-  console.log(`User connected: ${socket.id}`);
-
-  // User joins
   socket.on('user:join', (user) => {
-    onlineUsers.set(socket.id, {
-      username: user.username,
-      avatar: user.avatar,
-    });
+    onlineUsers.set(socket.id, { username: user.username, avatar: user.avatar });
+    socket.join('public');
     io.emit('users:online', Array.from(onlineUsers.values()));
-    io.emit('system:message', {
+    io.to('public').emit('system:message', {
       id: uuidv4(),
+      channel: 'public',
       type: 'system',
-      content: `${user.username} joined the chat`,
+      content: `${user.username} 加入了聊天`,
       createdAt: new Date().toISOString(),
     });
   });
 
-  // Text message
+  // Join a DM channel
+  socket.on('dm:open', ({ target }) => {
+    const user = onlineUsers.get(socket.id);
+    if (!user) return;
+    const channel = dmChannel(user.username, target);
+    socket.join(channel);
+  });
+
+  // Send message (public or DM)
   socket.on('message:send', (data) => {
     const user = onlineUsers.get(socket.id);
     if (!user) return;
 
+    const channel = data.target
+      ? dmChannel(user.username, data.target)
+      : 'public';
+
     const msg = {
       id: uuidv4(),
+      channel,
       username: user.username,
       avatar: user.avatar,
       type: 'text',
@@ -146,20 +155,39 @@ io.on('connection', (socket) => {
       fileSize: null,
       fileUrl: null,
       thumbUrl: null,
+      encrypted: data.encrypted ? 1 : 0,
       createdAt: new Date().toISOString(),
     };
 
     insertMsg.run(msg);
-    io.emit('message:new', msg);
+
+    if (data.target) {
+      // DM: send to both participants
+      const targetSocketIds = [];
+      for (const [sid, u] of onlineUsers) {
+        if (u.username === data.target) targetSocketIds.push(sid);
+      }
+      socket.emit('message:new', msg);
+      for (const sid of targetSocketIds) {
+        io.to(sid).emit('message:new', msg);
+      }
+    } else {
+      io.to('public').emit('message:new', msg);
+    }
   });
 
-  // File / image message
+  // File message (public or DM)
   socket.on('message:file', (data) => {
     const user = onlineUsers.get(socket.id);
     if (!user) return;
 
+    const channel = data.target
+      ? dmChannel(user.username, data.target)
+      : 'public';
+
     const msg = {
       id: uuidv4(),
+      channel,
       username: user.username,
       avatar: user.avatar,
       type: data.type || 'file',
@@ -168,42 +196,67 @@ io.on('connection', (socket) => {
       fileSize: data.fileSize,
       fileUrl: data.fileUrl,
       thumbUrl: data.thumbUrl || null,
+      encrypted: data.encrypted ? 1 : 0,
       createdAt: new Date().toISOString(),
     };
 
     insertMsg.run(msg);
-    io.emit('message:new', msg);
-  });
 
-  // Typing indicator
-  socket.on('user:typing', () => {
-    const user = onlineUsers.get(socket.id);
-    if (user) {
-      socket.broadcast.emit('user:typing', { username: user.username });
+    if (data.target) {
+      const targetSocketIds = [];
+      for (const [sid, u] of onlineUsers) {
+        if (u.username === data.target) targetSocketIds.push(sid);
+      }
+      socket.emit('message:new', msg);
+      for (const sid of targetSocketIds) {
+        io.to(sid).emit('message:new', msg);
+      }
+    } else {
+      io.to('public').emit('message:new', msg);
     }
   });
 
-  socket.on('user:stop-typing', () => {
+  socket.on('user:typing', (data) => {
     const user = onlineUsers.get(socket.id);
-    if (user) {
-      socket.broadcast.emit('user:stop-typing', { username: user.username });
+    if (!user) return;
+    if (data && data.target) {
+      for (const [sid, u] of onlineUsers) {
+        if (u.username === data.target) {
+          io.to(sid).emit('user:typing', { username: user.username, channel: dmChannel(user.username, data.target) });
+        }
+      }
+    } else {
+      socket.broadcast.emit('user:typing', { username: user.username, channel: 'public' });
     }
   });
 
-  // Disconnect
+  socket.on('user:stop-typing', (data) => {
+    const user = onlineUsers.get(socket.id);
+    if (!user) return;
+    if (data && data.target) {
+      for (const [sid, u] of onlineUsers) {
+        if (u.username === data.target) {
+          io.to(sid).emit('user:stop-typing', { username: user.username, channel: dmChannel(user.username, data.target) });
+        }
+      }
+    } else {
+      socket.broadcast.emit('user:stop-typing', { username: user.username, channel: 'public' });
+    }
+  });
+
   socket.on('disconnect', () => {
     const user = onlineUsers.get(socket.id);
     onlineUsers.delete(socket.id);
     io.emit('users:online', Array.from(onlineUsers.values()));
     if (user) {
-      io.emit('system:message', {
+      io.to('public').emit('system:message', {
         id: uuidv4(),
+        channel: 'public',
         type: 'system',
-        content: `${user.username} left the chat`,
+        content: `${user.username} 离开了聊天`,
         createdAt: new Date().toISOString(),
       });
     }
-    console.log(`User disconnected: ${socket.id}`);
   });
 });
 

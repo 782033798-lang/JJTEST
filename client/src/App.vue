@@ -36,5 +36,8 @@ function handleLogout() {
   display: flex;
   align-items: center;
   justify-content: center;
+  background:
+    radial-gradient(ellipse at 20% 50%, rgba(108, 92, 231, 0.08), transparent 60%),
+    radial-gradient(ellipse at 80% 20%, rgba(0, 206, 201, 0.05), transparent 50%);
 }
 </style>
